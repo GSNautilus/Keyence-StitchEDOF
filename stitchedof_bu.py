@@ -123,39 +123,27 @@ def phase_correlation_gpu(ref_crop, mov_crop, device=None):
     corr = torch.fft.ifftn(cross_power).real
 
     max_pos = torch.argmax(corr)
-    py, px = np.unravel_index(max_pos.cpu().item(), corr.shape)
-    Hc, Wc = corr.shape
-
-    # Parabolic sub-pixel fit on the integer peak. Use modular indexing so
-    # neighbors wrap across the FFT boundary — this keeps the fit symmetric
-    # for shifts near zero (where the old signed-coordinate check skipped it).
-    y_prev = (py - 1) % Hc
-    y_next = (py + 1) % Hc
-    x_prev = (px - 1) % Wc
-    x_next = (px + 1) % Wc
-
-    c = corr[py, px].item()
-    cu = corr[y_prev, px].item()
-    cd = corr[y_next, px].item()
-    cl = corr[py, x_prev].item()
-    cr = corr[py, x_next].item()
-
-    def fit_1d(a, b, c_):
-        denom = 2 * b - a - c_
-        return 0.0 if denom == 0 else 0.5 * (a - c_) / denom
-
-    dy = float(np.clip(fit_1d(cu, c, cd), -1.0, 1.0))
-    dx = float(np.clip(fit_1d(cl, c, cr), -1.0, 1.0))
-
-    # Convert integer peak to signed shift via FFT wraparound convention,
-    # then add the sub-pixel residual.
-    peak = np.array([py, px], dtype=np.float32)
+    peak = np.unravel_index(max_pos.cpu().item(), corr.shape)  # (py, px)
+    peak = np.array(peak, dtype=np.float32)
     shape = np.array(corr.shape, dtype=np.float32)
     mid = shape // 2
     peak[peak > mid] -= shape[peak > mid]
 
-    subpixel_shift = peak + np.array([dy, dx], dtype=np.float32)
-    return subpixel_shift[::-1]  # [dx, dy]
+    sz, sx = int(peak[0]), int(peak[1])
+    if 1 <= sz <= shape[0] - 2 and 1 <= sx <= shape[1] - 2:
+        patch = corr[sz - 1:sz + 2, sx - 1:sx + 2].cpu().numpy()
+
+        def fit_1d(p):
+            denom = 2 * p[1] - p[0] - p[2]
+            return 0.0 if denom == 0 else 0.5 * (p[0] - p[2]) / denom
+
+        dy = fit_1d(patch[:, 1])
+        dx = fit_1d(patch[1, :])
+
+        subpixel_shift = peak + np.array([dy, dx], dtype=np.float32)
+        return subpixel_shift[::-1]  # [dx, dy]
+    else:
+        return peak[::-1]  # [dx, dy]
 
 
 def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
@@ -304,19 +292,13 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
         positions[k] -= min_coords
 
     max_coords = np.stack(list(positions.values())).max(axis=0)
-    # +1 in each dimension so bilinear placement has room for its (h+1, w+1) footprint.
-    canvas_w = int(np.ceil(max_coords[0] + tile_w)) + 1
-    canvas_h = int(np.ceil(max_coords[1] + tile_h)) + 1
+    canvas_w = int(np.ceil(max_coords[0] + tile_w))
+    canvas_h = int(np.ceil(max_coords[1] + tile_h))
     canvas = np.zeros((canvas_h, canvas_w), dtype=np.float32)
     weight_map = np.zeros((canvas_h, canvas_w), dtype=np.float32)
 
     for idx, pos in positions.items():
-        x_f, y_f = float(pos[0]), float(pos[1])
-        x_int = int(np.floor(x_f))
-        y_int = int(np.floor(y_f))
-        x_frac = x_f - x_int
-        y_frac = y_f - y_int
-
+        x, y = np.round(pos).astype(int)
         tile = tile_images[idx].astype(np.float32)
         h, w = tile.shape
 
@@ -335,25 +317,8 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
             weight[:ramp_h, :] *= ramp[:, None]
             weight[-ramp_h:, :] *= ramp[::-1][:, None]
 
-        weighted_tile = tile * weight
-
-        # Bilinear sub-pixel placement: distribute each tile pixel across the
-        # 4 surrounding canvas pixels by the fractional offset, so we keep the
-        # sub-pixel precision that phase correlation recovered.
-        w00 = (1.0 - x_frac) * (1.0 - y_frac)
-        w10 = x_frac * (1.0 - y_frac)
-        w01 = (1.0 - x_frac) * y_frac
-        w11 = x_frac * y_frac
-
-        canvas[y_int:y_int + h,     x_int:x_int + w]         += weighted_tile * w00
-        canvas[y_int:y_int + h,     x_int + 1:x_int + w + 1] += weighted_tile * w10
-        canvas[y_int + 1:y_int + h + 1, x_int:x_int + w]         += weighted_tile * w01
-        canvas[y_int + 1:y_int + h + 1, x_int + 1:x_int + w + 1] += weighted_tile * w11
-
-        weight_map[y_int:y_int + h,     x_int:x_int + w]         += weight * w00
-        weight_map[y_int:y_int + h,     x_int + 1:x_int + w + 1] += weight * w10
-        weight_map[y_int + 1:y_int + h + 1, x_int:x_int + w]         += weight * w01
-        weight_map[y_int + 1:y_int + h + 1, x_int + 1:x_int + w + 1] += weight * w11
+        canvas[y:y + h, x:x + w] += tile * weight
+        weight_map[y:y + h, x:x + w] += weight
 
     nonzero = weight_map > 0
     canvas[nonzero] /= weight_map[nonzero]
