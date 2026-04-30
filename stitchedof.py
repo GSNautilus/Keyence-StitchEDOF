@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 import torch
+import torch.nn.functional as F
 import zipfile
 import xml.etree.ElementTree as ET
 from scipy.ndimage import uniform_filter
@@ -93,6 +94,57 @@ def edof_worker(args):
     del stack, slices_sorted
     gc.collect()
     return tile_id, edof
+
+
+def tile_loader_worker(args):
+    """
+    Worker that ONLY loads a tile's Z-stack from disk and returns it as uint16.
+    Used by the GPU EDOF path: parallel disk reads happen in worker processes
+    (which is what makes I/O fast), then the main process consumes stacks
+    one-by-one and runs EDOF on the GPU.
+    """
+    tile_id, slices = args
+    slices_sorted = sorted(slices, key=lambda x: x[0])
+    stack = np.stack([tifffile.imread(f) for (_, f) in slices_sorted], axis=0)
+    return tile_id, stack
+
+
+def edof_from_stack_gpu(stack, patch_size=7, alpha=0.7, device='cuda'):
+    """
+    Per-slice GPU EDOF: same scoring as the CPU version, but each Z slice's
+    box-filter mean / variance is computed on the GPU via avg_pool2d, and the
+    best-score / best-pixel maps are updated on the GPU as we walk through Z.
+
+    Per-slice (vs. one giant batched (Z,1,H,W) tensor) keeps VRAM bounded —
+    important on smaller GPUs and for large Z stacks. Kernel-launch overhead
+    at K=7 is negligible compared to the convolution work.
+    """
+    z, h, w = stack.shape
+    stack_t = torch.from_numpy(stack).to(device=device, dtype=torch.float32)
+
+    stack_min = stack_t.min()
+    stack_ptp = (stack_t.max() - stack_min).clamp(min=1e-6)
+
+    pad = patch_size // 2
+    best_score = torch.full((h, w), float('-inf'), device=device, dtype=torch.float32)
+    best_val = torch.zeros((h, w), device=device, dtype=torch.float32)
+
+    for i in range(z):
+        raw = stack_t[i]
+        img = (raw - stack_min) / stack_ptp                     # (H, W)
+        img_b = img.unsqueeze(0).unsqueeze(0)                   # (1,1,H,W)
+        img_pad = F.pad(img_b, (pad, pad, pad, pad), mode='reflect')
+        sq_pad = F.pad(img_b * img_b, (pad, pad, pad, pad), mode='reflect')
+        mean = F.avg_pool2d(img_pad, kernel_size=patch_size, stride=1).squeeze()
+        mean_sq = F.avg_pool2d(sq_pad, kernel_size=patch_size, stride=1).squeeze()
+        local_var = mean_sq - mean * mean
+        score = alpha * local_var + (1.0 - alpha) * (1.0 - img)
+
+        update = score > best_score
+        best_score = torch.where(update, score, best_score)
+        best_val = torch.where(update, raw, best_val)
+
+    return best_val.cpu().numpy()
 
 
 def extract_tile_grid(gci_path):
@@ -170,6 +222,24 @@ def phase_correlation_gpu(ref_crop, mov_crop, device=None):
     return subpixel_shift[::-1]  # [dx, dy]
 
 
+def _ncc(a, b):
+    # Normalized cross-correlation between two equal-shape arrays.
+    # Used to flag low-quality phase-correlation alignments.
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+    a_std = a.std()
+    b_std = b.std()
+    if a_std < 1e-6 or b_std < 1e-6:
+        return 0.0
+    return float(np.mean(((a - a.mean()) / a_std) * ((b - b.mean()) / b_std)))
+
+
+# Alignment-quality thresholds. Below these, we warn that the recovered shift
+# may be unreliable (typical cause: stage drift/tilt during acquisition).
+NCC_WARN_THRESHOLD = 0.3
+STAGGER_WARN_FRAC = 0.05  # fraction of tile height per single horizontal step
+
+
 def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
     """
     Build global tile positions from serpentine tile IDs.
@@ -181,6 +251,9 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
 
     ov_w = max(1, int(tile_w * overlap_frac))
     ov_h = max(1, int(tile_h * overlap_frac))
+    stagger_warn_px = tile_h * STAGGER_WARN_FRAC
+
+    warnings = []  # collect quality issues to summarize at the end
 
     # Step must match the integer strip size used when rendering overlap regions;
     # a float step like tile_dim*(1-overlap) drifts by the fractional part each row/col.
@@ -204,6 +277,8 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
     def chain_row_left_to_right(row):
         # Build per-row positions using horizontal overlaps only.
         row_positions = {tile_id_at(row, 0): np.array([0.0, 0.0], dtype=np.float32)}
+        low_ncc_pairs = []
+        large_stagger_pairs = []
         for col in range(1, cols):
             idx = tile_id_at(row, col)
             left_idx = tile_id_at(row, col - 1)
@@ -211,9 +286,34 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
             mov = tile_images[idx]
             ref_crop = ref[:, -ov_w:]
             mov_crop = mov[:, :ov_w]
+            ncc = _ncc(ref_crop, mov_crop)
             shift = phase_correlation_gpu(ref_crop, mov_crop, device=corr_device)
+            if ncc < NCC_WARN_THRESHOLD:
+                low_ncc_pairs.append((left_idx, idx, ncc))
+            if abs(shift[1]) > stagger_warn_px:
+                large_stagger_pairs.append((left_idx, idx, float(shift[1])))
             offset = np.array([nominal_step[0], 0.0], dtype=np.float32) + shift
             row_positions[idx] = row_positions[left_idx] + offset
+
+        # Aggregate per-row diagnostics.
+        ys = np.array([row_positions[tile_id_at(row, c)][1] for c in range(cols)])
+        y_span = float(ys.max() - ys.min())
+        if low_ncc_pairs:
+            details = ", ".join(f"T{a}->T{b}:{n:.2f}" for a, b, n in low_ncc_pairs)
+            msg = f"Row {row}: low horizontal NCC (<{NCC_WARN_THRESHOLD}) for {len(low_ncc_pairs)} pair(s): {details}"
+            print(f"  WARNING: {msg}")
+            warnings.append(msg)
+        if large_stagger_pairs:
+            details = ", ".join(f"T{a}->T{b}:dy={d:.0f}px" for a, b, d in large_stagger_pairs)
+            msg = (f"Row {row}: large per-step Y stagger (>{stagger_warn_px:.0f}px = "
+                   f"{STAGGER_WARN_FRAC*100:.0f}% of tile height): {details}")
+            print(f"  WARNING: {msg}")
+            warnings.append(msg)
+        if y_span > tile_h * 0.1:
+            msg = (f"Row {row}: total Y stagger across row = {y_span:.0f}px "
+                   f"({y_span/tile_h*100:.1f}% of tile height) — likely stage tilt/drift")
+            print(f"  WARNING: {msg}")
+            warnings.append(msg)
         return row_positions
 
     def render_row_strip(row_positions, row, which):
@@ -251,7 +351,16 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
                 above_row_positions = {tile_id_at(row - 1, c): positions[tile_id_at(row - 1, c)] for c in range(cols)}
                 ref_strip, above_min = render_row_strip(above_row_positions, row - 1, "bottom")
                 mov_strip, curr_min = render_row_strip(current_local, row, "top")
+                # Match shapes for NCC (render_row_strip can produce slightly different sizes per row).
+                h = min(ref_strip.shape[0], mov_strip.shape[0])
+                w = min(ref_strip.shape[1], mov_strip.shape[1])
+                strip_ncc = _ncc(ref_strip[:h, :w], mov_strip[:h, :w])
                 row_shift = phase_correlation_gpu(ref_strip, mov_strip, device=corr_device)
+                if strip_ncc < NCC_WARN_THRESHOLD:
+                    msg = (f"Row {row-1}->Row {row}: row-strip NCC = {strip_ncc:.2f} "
+                           f"(<{NCC_WARN_THRESHOLD}) — vertical alignment unreliable")
+                    print(f"  WARNING: {msg}")
+                    warnings.append(msg)
                 # Apply nominal row step plus phase-correlation residual.
                 row_offset = (
                     above_min
@@ -289,7 +398,13 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
 
                 ref_crop = ref[-ov_h:, :]
                 mov_crop = mov[:ov_h, :]
+                anchor_ncc = _ncc(ref_crop, mov_crop)
                 shift = phase_correlation_gpu(ref_crop, mov_crop, device=corr_device)
+                if anchor_ncc < NCC_WARN_THRESHOLD:
+                    msg = (f"Row {row-1}->Row {row}: anchor pair T{above_anchor}->T{idx_anchor} "
+                           f"NCC = {anchor_ncc:.2f} (<{NCC_WARN_THRESHOLD}) — vertical alignment unreliable")
+                    print(f"  WARNING: {msg}")
+                    warnings.append(msg)
 
                 offset = np.array([0.0, nominal_step[1]], dtype=np.float32) + shift
                 positions[idx_anchor] = positions[above_anchor] + offset
@@ -308,6 +423,11 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
 
                     offset = np.array([-nominal_step[0], 0.0], dtype=np.float32) + shift
                     positions[idx] = positions[right_idx] + offset
+
+    if warnings:
+        print(f"\nAlignment quality summary: {len(warnings)} warning(s) — "
+              f"the source acquisition may have stage drift/tilt and the stitched "
+              f"output is likely misaligned. Inspect seams before relying on the result.\n")
 
     # Shift coordinates so the stitched canvas starts at (0, 0).
     all_coords = np.stack(list(positions.values()))
@@ -545,25 +665,63 @@ def main():
         "save": save_edof,
     }
 
-    tasks = [(tile_id, slices, config) for tile_id, slices in tile_dict.items()]
-    workers, per_worker_bytes = choose_workers(tile_dict, args.workers)
-    try:
-        with Pool(processes=workers) as pool:
-            results = list(tqdm(pool.imap_unordered(edof_worker, tasks), total=len(tasks), desc="EDOF"))
-    except (MemoryError, BrokenPipeError, EOFError, OSError) as e:
-        print_oom_help(workers, per_worker_bytes, e)
-        raise
-    except Exception as e:
-        # Worker crashes can surface as generic exceptions on Windows; if the
-        # message looks memory-related, show the OOM help anyway.
-        msg = f"{type(e).__name__}: {e}".lower()
-        if any(s in msg for s in ("memory", "alloc", "paging", "0xc00000fd", "killed")):
-            print_oom_help(workers, per_worker_bytes, e)
-        else:
-            traceback.print_exc()
-        raise
+    use_gpu = torch.cuda.is_available()
+    print(f"EDOF device: {'CUDA' if use_gpu else 'CPU'}")
 
-    tile_images = {tile_id: edof for tile_id, edof in results}
+    workers, per_worker_bytes = choose_workers(tile_dict, args.workers)
+    tile_images = {}
+
+    if use_gpu:
+        # GPU path: workers do disk reads only (parallel I/O), main process
+        # consumes stacks via imap_unordered and runs EDOF on the GPU as each
+        # one arrives — overlapping I/O with compute.
+        load_tasks = [(tile_id, slices) for tile_id, slices in tile_dict.items()]
+        try:
+            with Pool(processes=workers) as pool:
+                for tile_id, stack in tqdm(
+                    pool.imap_unordered(tile_loader_worker, load_tasks),
+                    total=len(load_tasks), desc="EDOF",
+                ):
+                    edof = edof_from_stack_gpu(
+                        stack, args.patch_size, args.alpha, device='cuda'
+                    ).astype(np.uint16)
+                    if save_edof:
+                        tifffile.imwrite(output_dir / f"tile_{tile_id:05d}_edof.tif", edof)
+                    tile_images[tile_id] = edof
+                    del stack
+                    gc.collect()
+        except (MemoryError, BrokenPipeError, EOFError, OSError) as e:
+            print_oom_help(workers, per_worker_bytes, e)
+            raise
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}".lower()
+            if any(s in msg for s in ("memory", "alloc", "paging", "0xc00000fd", "killed")):
+                print_oom_help(workers, per_worker_bytes, e)
+            else:
+                traceback.print_exc()
+            raise
+    else:
+        # CPU path: original behavior — each worker loads its tile and runs
+        # the scipy-based EDOF. Multiprocessing parallelizes both I/O and
+        # compute across CPU cores.
+        tasks = [(tile_id, slices, config) for tile_id, slices in tile_dict.items()]
+        try:
+            with Pool(processes=workers) as pool:
+                results = list(tqdm(
+                    pool.imap_unordered(edof_worker, tasks),
+                    total=len(tasks), desc="EDOF",
+                ))
+        except (MemoryError, BrokenPipeError, EOFError, OSError) as e:
+            print_oom_help(workers, per_worker_bytes, e)
+            raise
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}".lower()
+            if any(s in msg for s in ("memory", "alloc", "paging", "0xc00000fd", "killed")):
+                print_oom_help(workers, per_worker_bytes, e)
+            else:
+                traceback.print_exc()
+            raise
+        tile_images = {tile_id: edof for tile_id, edof in results}
 
     stitched = stitch_tiles(tile_images, rows, cols, overlap_frac=args.overlap, row_stitch=not args.tilestitch)
 
