@@ -4,6 +4,7 @@
 # Takes tiled image sequence and the .gci metadata file from Keyence as input and outputs single stitched edof image
 #
 # Requirements: numpy, tifffile, scipy, tqdm, torch
+# Optional: psutil (enables memory-aware default for --workers)
 #
 # Command examples:
 #   python stitchedof.py data
@@ -19,7 +20,10 @@
 # CLI options:
 #   --patch_size N    EDOF local-statistics window size (default: 7)
 #   --alpha A         EDOF score mixing factor in [0,1] (default: 0.7)
-#   --workers N       Number of multiprocessing workers (default: CPU count)
+#   --workers N       Number of multiprocessing workers. Default: auto-sized
+#                     from available RAM and a per-tile working-set estimate
+#                     (requires psutil); falls back to min(cpu_count, 4) if
+#                     psutil is missing.
 #   --edofsave BOOL   Save per-tile EDOF TIFFs: true/false (default: false)
 #   --overlap F       Fractional tile overlap for alignment/blending (default: 0.3)
 #   --tilestitch      Use legacy single-tile row anchoring instead of default row-stitch mode
@@ -34,8 +38,16 @@ from scipy.ndimage import uniform_filter
 from multiprocessing import Pool, cpu_count
 import re
 import gc
+import os
 import argparse
+import traceback
 from tqdm import tqdm
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 
 def edof_from_stack(stack, patch_size=5, alpha=0.6):
@@ -360,6 +372,113 @@ def stitch_tiles(tile_images, rows, cols, overlap_frac=0.3, row_stitch=True):
     return np.clip(canvas, 0, 65535).astype(np.uint16)
 
 
+def estimate_per_worker_bytes(tile_dict):
+    """
+    Estimate peak memory used by one EDOF worker on the largest tile-stack in
+    the dataset.
+
+    The peak in edof_from_stack happens during `stack.astype(np.float32)`,
+    where the uint16 stack and the new float32 stack briefly coexist:
+        uint16_stack + float32_stack = z*h*w*2 + z*h*w*4 = 1.5 x float32_stack
+    After that, steady state is ~1 x float32_stack plus a handful of single-
+    slice (h*w) intermediates inside the loop, which are negligible compared
+    to the stack.
+
+    We model peak as 2.0 x float32_stack — the 1.5x astype overlap rounded up
+    for Python/numpy overhead, list-of-slices memory during np.stack, and
+    interpreter footprint. The downstream "use 70% of available RAM" budget
+    provides additional safety margin.
+    """
+    if not tile_dict:
+        return 0
+    # Use the deepest stack and a real tile to read shape/dtype.
+    sample_id = max(tile_dict, key=lambda k: len(tile_dict[k]))
+    slices = tile_dict[sample_id]
+    z = len(slices)
+    sample = tifffile.imread(slices[0][1])
+    h, w = sample.shape[-2], sample.shape[-1]
+    float32_stack = z * h * w * 4
+    return int(float32_stack * 2.0)
+
+
+def available_memory_bytes():
+    """Available RAM in bytes, or None if psutil is missing."""
+    if not _HAS_PSUTIL:
+        return None
+    try:
+        return psutil.virtual_memory().available
+    except Exception:
+        return None
+
+
+def choose_workers(tile_dict, requested):
+    """
+    Pick a worker count that won't OOM. Honors --workers if given; otherwise
+    sizes by available RAM and CPU count. Falls back to a conservative default
+    when psutil isn't installed.
+    """
+    cpu = cpu_count() or 1
+    per_worker = estimate_per_worker_bytes(tile_dict)
+    avail = available_memory_bytes()
+
+    if requested is not None and requested > 0:
+        chosen = requested
+        source = "user-specified"
+    elif avail is None:
+        # No psutil: be conservative. Most boxes survive 4 workers; users with
+        # bigger machines can override with --workers.
+        chosen = max(1, min(cpu, 4))
+        source = "default (psutil not installed; install for memory-aware sizing)"
+    else:
+        # Use ~70% of available RAM as the budget — leaves headroom for the
+        # stitching stage, the OS, and anything else running.
+        budget = int(avail * 0.70)
+        by_mem = max(1, budget // max(per_worker, 1))
+        chosen = max(1, min(cpu, by_mem))
+        source = "memory-aware auto"
+
+    print(
+        f"Workers: {chosen} ({source}) | "
+        f"CPU cores: {cpu} | "
+        f"Est. per-worker peak: {per_worker / 1e9:.2f} GB"
+        + (f" | Available RAM: {avail / 1e9:.2f} GB" if avail is not None else "")
+    )
+    return chosen, per_worker
+
+
+def print_oom_help(workers, per_worker_bytes, exc):
+    """Verbose, actionable diagnostic when the EDOF stage runs out of memory."""
+    suggested = max(1, workers // 2)
+    avail = available_memory_bytes()
+    bar = "=" * 72
+    print("\n" + bar)
+    print("ERROR: The EDOF stage ran out of memory (or a worker process died).")
+    print(bar)
+    print(f"Underlying error: {type(exc).__name__}: {exc}")
+    print(f"Workers used:               {workers}")
+    print(f"Estimated peak per worker:  {per_worker_bytes / 1e9:.2f} GB")
+    print(f"Estimated total at peak:    {workers * per_worker_bytes / 1e9:.2f} GB")
+    if avail is not None:
+        print(f"Available RAM right now:    {avail / 1e9:.2f} GB")
+    if not _HAS_PSUTIL:
+        print("Note: psutil is not installed, so the auto-default could not size")
+        print("      itself to your machine. Install it for better defaults:")
+        print("          pip install psutil")
+    print("")
+    print("WHAT HAPPENED")
+    print("  Each EDOF worker loads a full Z-stack for one tile and builds")
+    print("  several float32 buffers the size of that stack. With many workers")
+    print("  in parallel, peak RAM = workers x per-worker working set, which")
+    print("  can exceed available memory and crash the run.")
+    print("")
+    print("HOW TO FIX")
+    print(f"  Re-run with fewer workers, e.g.:")
+    print(f"      --workers {suggested}")
+    print("  If --workers 1 still OOMs, your tile Z-stacks are too large to")
+    print("  fit; close other apps or run on a machine with more RAM.")
+    print(bar + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="EDOF + Stitching Pipeline")
     parser.add_argument("input_dir", help="Input directory containing image tiles and a single .gci file")
@@ -368,7 +487,11 @@ def main():
 
     parser.add_argument("--patch_size", type=int, default=7)
     parser.add_argument("--alpha", type=float, default=0.7)
-    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Multiprocessing workers. Default: memory-aware "
+                             "auto-sizing (uses ~70%% of available RAM, capped "
+                             "at CPU count). Requires psutil; falls back to "
+                             "min(cpu_count, 4) without it.")
     parser.add_argument("--edofsave", type=str, default="false")
     parser.add_argument("--overlap", type=float, default=0.3)
     parser.add_argument("--tilestitch", action="store_true",
@@ -423,8 +546,22 @@ def main():
     }
 
     tasks = [(tile_id, slices, config) for tile_id, slices in tile_dict.items()]
-    with Pool(processes=args.workers or cpu_count()) as pool:
-        results = list(tqdm(pool.imap_unordered(edof_worker, tasks), total=len(tasks), desc="EDOF"))
+    workers, per_worker_bytes = choose_workers(tile_dict, args.workers)
+    try:
+        with Pool(processes=workers) as pool:
+            results = list(tqdm(pool.imap_unordered(edof_worker, tasks), total=len(tasks), desc="EDOF"))
+    except (MemoryError, BrokenPipeError, EOFError, OSError) as e:
+        print_oom_help(workers, per_worker_bytes, e)
+        raise
+    except Exception as e:
+        # Worker crashes can surface as generic exceptions on Windows; if the
+        # message looks memory-related, show the OOM help anyway.
+        msg = f"{type(e).__name__}: {e}".lower()
+        if any(s in msg for s in ("memory", "alloc", "paging", "0xc00000fd", "killed")):
+            print_oom_help(workers, per_worker_bytes, e)
+        else:
+            traceback.print_exc()
+        raise
 
     tile_images = {tile_id: edof for tile_id, edof in results}
 
